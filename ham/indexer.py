@@ -8,7 +8,7 @@ import json
 import re
 from pathlib import Path
 from datetime import datetime
-from memory_engine import MemoryEngine, DB_PATH
+from ham.memory_engine import MemoryEngine, DB_PATH
 
 MEMORY_DIR = Path.home() / ".hermes" / "memory"
 SESSION_SEARCH_DIR = Path.home() / ".hermes" / "sessions"

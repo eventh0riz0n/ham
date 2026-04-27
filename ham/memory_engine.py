@@ -263,12 +263,36 @@ class MemoryEngine:
         self.embedding_mgr = EmbeddingManager(self.conn)
 
     def _init_db(self):
-        """Create tables and virtual tables."""
+        """Create tables, run migrations, set up triggers."""
         # Enable sqlite-vec
         self.conn.enable_load_extension(True)
         sqlite_vec.load(self.conn)
         self.conn.enable_load_extension(False)
 
+        # Schema version tracking
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            )
+        """)
+
+        current = self.conn.execute(
+            "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        current_version = current[0] if current else 0
+
+        if current_version < 1:
+            self._migrate_v1()
+            self.conn.execute(
+                "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+                (1, self._now_ts()),
+            )
+
+        self.conn.commit()
+
+    def _migrate_v1(self):
+        """Initial schema."""
         # Main chunks table
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS chunks (
@@ -363,8 +387,6 @@ class MemoryEngine:
                 VALUES (new.rowid, new.text, new.source, new.store);
             END
         """)
-
-        self.conn.commit()
 
     def _text_hash(self, text: str) -> str:
         return hashlib.sha256(text.encode()).hexdigest()[:32]

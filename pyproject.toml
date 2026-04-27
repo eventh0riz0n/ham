@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ham-memory"
+version = "0.1.0"
+description = "HAM 🍖 — Hermes Advanced Memory. Local-first, multi-store hybrid memory for AI agents."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "eventh0riz0n"},
+]
+keywords = ["memory", "ai", "agent", "sqlite", "vector", "bm25", "embeddings"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.24",
+    "sqlite-vec>=0.1",
+]
+
+[project.optional-dependencies]
+local = ["fastembed>=0.3"]      # local CPU fallback embeddings
+dev = ["pytest>=7.0", "black", "ruff"]
+all = ["fastembed>=0.3", "pytest>=7.0", "black", "ruff"]
+
+[project.scripts]
+ham = "ham.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/eventh0riz0n/ham"
+Repository = "https://github.com/eventh0riz0n/ham"
+Issues = "https://github.com/eventh0riz0n/ham/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["ham"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

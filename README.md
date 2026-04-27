@@ -50,23 +50,26 @@ User conversation
 ## Quick Start
 
 ```bash
-# Install dependencies
-uv pip install sqlite-vec fastembed
+# Install
+pip install -e .
+
+# Or with local fallback support
+pip install -e ".[local]"
 
 # 1. Index your workspace
-python scripts/indexer.py --full
+ham index --full
 
 # 2. Remember something
-python scripts/memory_engine.py -r "User prefers dark mode" -s semantic --importance 0.8
+ham remember "User prefers dark mode" --store semantic --importance 0.8
 
 # 3. Recall
-python scripts/memory_engine.py -q "what did user say about crypto"
+ham recall "what did user say about crypto"
 
 # 4. Stats
-python scripts/memory_engine.py --stats
+ham stats
 
 # 5. Consolidate old memories (weekly cron recommended)
-python scripts/memory_engine.py --consolidate
+ham consolidate
 ```
 
 ---
@@ -129,35 +132,47 @@ HAM detects this and **automatically disables vector search** when providers mis
 
 | File | Purpose |
 |---|---|
-| `scripts/memory_engine.py` | Core engine (SQLite + sqlite-vec + FTS5) |
-| `scripts/indexer.py` | Auto-indexes memory files, workspace docs, skills |
-| `scripts/session_hook.py` | Saves sessions, extracts facts, retrieves context |
+| `ham/memory_engine.py` | Core engine (SQLite + sqlite-vec + FTS5) |
+| `ham/indexer.py` | Auto-indexes memory files, workspace docs, skills |
+| `ham/session_hook.py` | Saves sessions, extracts facts, retrieves context |
+| `ham/cli.py` | `ham` command-line interface |
 
 ---
 
 ## Database Schema
 
-Single SQLite file (`~/.hermes/memory/ham.db` or set `HAM_DB_PATH`):
+Single SQLite file (`~/.hermes/memory/ham.db` or set `HAM_DB_PATH`). Versioned migrations (see `schema_version` table).
 
-- `chunks` — all memory chunks
-- `chunks_fts` — FTS5 virtual table
-- `chunks_vec` — sqlite-vec virtual table (3072 dims)
-- `embedding_cache` — deduped embeddings with provider tracking
-- `semantic_links` — graph relationships
-- `consolidation_log` — auto-maintenance log
+| Table | Purpose |
+|---|---|
+| `chunks` | All memory chunks |
+| `chunks_fts` | FTS5 virtual table |
+| `chunks_vec` | sqlite-vec virtual table (3072 dims) |
+| `embedding_cache` | Deduped embeddings with provider tracking |
+| `semantic_links` | Graph relationships |
+| `consolidation_log` | Auto-maintenance log |
+| `schema_version` | Migration tracking |
 
 ---
 
 ## Integration
 
-```python
-from memory_engine import MemoryEngine
-from session_hook import get_context_for_prompt
+### Python API
 
-# Retrieve relevant context for a prompt
-context = get_context_for_prompt("planning a trip", top_k=5)
-# prepend context to system prompt
+```python
+from ham.memory_engine import MemoryEngine
+from ham.session_hook import get_context_for_prompt
+
+engine = MemoryEngine()
+engine.remember("User likes dark mode", store="semantic", importance=0.8)
+results = engine.recall("dark mode", top_k=5)
 ```
+
+### Hermes Skill
+
+If you use Hermes Agent, the `advanced-memory` skill is auto-detected. Type `/advanced-memory` in chat to load this skill into context.
+
+Session hook integration is manual for now — call `save_session()` at the end of conversations.
 
 ---
 
@@ -165,23 +180,39 @@ context = get_context_for_prompt("planning a trip", top_k=5)
 
 **Daily indexer** (4:00 AM):
 ```bash
-python scripts/indexer.py --full
+ham index --full
 ```
 
 **Weekly consolidation** (Sunday 3:00 AM):
 ```bash
-python scripts/memory_engine.py --consolidate
+ham consolidate
+```
+
+---
+
+## Development
+
+```bash
+# Run tests
+pytest
+
+# Install with dev deps
+pip install -e ".[dev]"
 ```
 
 ---
 
 ## Status
 
-Work in progress. Core engine is solid and battle-tested. Missing before 1.0:
-- [ ] Unit tests
-- [ ] `pyproject.toml`
-- [ ] CLI (`ham recall/remember`)
-- [ ] Native Hermes session hook integration
-- [ ] Schema versioning
+| Feature | Status |
+|---|---|
+| Core engine (BM25 + vector hybrid) | ✅ Solid |
+| Multi-tier embedding fallback | ✅ Done |
+| Provider-aware vector guard | ✅ Done |
+| Schema versioning | ✅ Done |
+| CLI (`ham recall/remember/stats/consolidate/index`) | ✅ Done |
+| Unit tests | ✅ Basic suite |
+| `pyproject.toml` | ✅ Done |
+| Native Hermes session hook | 🔄 Manual for now |
 
 PRs welcome.

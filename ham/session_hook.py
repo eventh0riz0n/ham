@@ -9,7 +9,7 @@ import json
 import sys
 from pathlib import Path
 from datetime import datetime
-from memory_engine import MemoryEngine, DB_PATH
+from ham.memory_engine import MemoryEngine, DB_PATH
 
 
 def save_session(session_text: str, session_id: str = None, metadata: dict = None):
