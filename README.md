@@ -50,7 +50,10 @@ User conversation
 ## Quick Start
 
 ```bash
-# Install
+# Install from GitHub
+pip install git+https://github.com/eventh0riz0n/ham.git
+
+# Or install from a local clone
 pip install -e .
 
 # Or with local fallback support
@@ -59,19 +62,29 @@ pip install -e ".[local]"
 # Or everything (local fallback + OpenRouter + dev tools)
 pip install -e ".[all]"
 
-# 1. Index your workspace
+# 1. Check health
+ham doctor
+
+# 2. Preview indexing without writing the DB
+ham index --dry-run
+
+# 3. Index your workspace
 ham index --full
 
-# 2. Remember something
+# 4. Remember something
 ham remember "User prefers dark mode" --store semantic --importance 0.8
 
-# 3. Recall
+# 5. Recall
 ham recall "what did user say about crypto"
 
-# 4. Stats
-ham stats
+# 6. Manage chunks
+ham list --store semantic
+ham show CHUNK_ID
+ham delete CHUNK_ID
 
-# 5. Consolidate old memories (weekly cron recommended)
+# 7. Backup / maintenance
+ham backup --out ~/ham-backup.db
+# Use --force only when you intentionally want to overwrite an existing backup.
 ham consolidate
 ```
 
@@ -138,7 +151,7 @@ HAM detects this and **automatically disables vector search** when providers mis
 | `ham/memory_engine.py` | Core engine (SQLite + sqlite-vec + FTS5) |
 | `ham/indexer.py` | Auto-indexes memory files, workspace docs, skills |
 | `ham/session_hook.py` | Saves sessions, extracts facts, retrieves context |
-| `ham/cli.py` | `ham` command-line interface |
+| `ham/cli.py` | `ham` command-line interface: recall/remember/list/show/delete/doctor/backup/index |
 
 ---
 
@@ -213,8 +226,8 @@ pip install -e ".[dev]"
 | Multi-tier embedding fallback | ✅ Done |
 | Provider-aware vector guard | ✅ Done |
 | Schema versioning | ✅ Done |
-| CLI (`ham recall/remember/stats/consolidate/index`) | ✅ Done |
-| Unit tests | ✅ Basic suite |
+| CLI (`ham recall/remember/list/show/delete/stats/consolidate/index/doctor/backup/migrate`) | ✅ Done |
+| Unit tests + CI | ✅ Done |
 | `pyproject.toml` | ✅ Done |
 | Native Hermes session hook | 🔄 Manual for now |
 

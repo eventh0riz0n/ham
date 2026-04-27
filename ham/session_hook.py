@@ -6,7 +6,7 @@ Also retrieves relevant context before next conversation.
 """
 
 import json
-import sys
+import re
 from pathlib import Path
 from datetime import datetime
 from ham.memory_engine import MemoryEngine, DB_PATH

@@ -18,12 +18,13 @@ import sqlite3
 import sqlite_vec
 import numpy as np
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, asdict
 import re
 import struct
 import os
+import shutil
 
 # Load .env if present
 _env_path = Path.home() / ".hermes" / ".env"
@@ -69,7 +70,8 @@ class GeminiProvider:
     def embed(self, texts: List[str]) -> List[List[float]]:
         if not self.api_key:
             raise RuntimeError("No GEMINI_API_KEY")
-        import urllib.request, json, time
+        import time
+        import urllib.request
         results = []
         for text in texts:
             embedding = None
@@ -107,7 +109,8 @@ class OpenRouterProvider:
     def embed(self, texts: List[str]) -> List[List[float]]:
         if not self.api_key:
             raise RuntimeError("No OPENROUTER_API_KEY")
-        import openai, time
+        import time
+        import openai
         client = openai.OpenAI(base_url=self.base_url, api_key=self.api_key)
         for attempt in range(self.max_retries):
             try:
@@ -178,13 +181,28 @@ class EmbeddingManager:
         return int(datetime.now().timestamp())
 
     def get_embeddings(self, texts: List[str]) -> Tuple[List[List[float]], str]:
-        """Return (embeddings, provider_name). Uses cache + fallback chain."""
+        """Return (embeddings, provider_name). Uses cache + fallback chain.
+
+        Backward-compatible wrapper for callers that only need a single provider
+        name. For batched writes, use get_embeddings_with_providers() so cached
+        and newly-created vectors can retain their per-vector provider metadata.
+        """
+        embeddings, providers = self.get_embeddings_with_providers(texts)
+        if not providers:
+            return embeddings, "none"
+        if len(set(providers)) == 1:
+            return embeddings, providers[0]
+        from collections import Counter
+        return embeddings, Counter(providers).most_common(1)[0][0]
+
+    def get_embeddings_with_providers(self, texts: List[str]) -> Tuple[List[List[float]], List[str]]:
+        """Return embeddings plus the provider that produced each vector."""
         if not texts:
-            return [], "none"
+            return [], []
 
         text_hashes = [self._text_hash(t) for t in texts]
         embeddings: List[Optional[List[float]]] = [None] * len(texts)
-        missing_indices: List[int] = []
+        providers: List[Optional[str]] = [None] * len(texts)
 
         for i, h in enumerate(text_hashes):
             row = self.conn.execute(
@@ -194,19 +212,12 @@ class EmbeddingManager:
             if row:
                 count = len(row[0]) // 4
                 embeddings[i] = list(struct.unpack(f'{count}f', row[0]))
+                providers[i] = row[1]
 
         missing_indices = [i for i, e in enumerate(embeddings) if e is None]
 
         if not missing_indices:
-            # All from cache — return the most common provider (default gemini if mixed)
-            providers = [row[0] for row in self.conn.execute(
-                "SELECT model FROM embedding_cache WHERE text_hash IN ({})".format(
-                    ','.join('?' * len(text_hashes))
-                ), text_hashes
-            ).fetchall()]
-            from collections import Counter
-            provider = Counter(providers).most_common(1)[0][0] if providers else "gemini"
-            return [e for e in embeddings if e is not None], provider
+            return [e for e in embeddings if e is not None], [p or "unknown" for p in providers]
 
         missing_texts = [texts[i] for i in missing_indices]
 
@@ -217,6 +228,7 @@ class EmbeddingManager:
                     if len(raw_emb) != self.target_dim:
                         raw_emb = EmbeddingProjector.project(raw_emb, self.target_dim)
                     embeddings[missing_indices[idx_in_missing]] = raw_emb
+                    providers[missing_indices[idx_in_missing]] = provider.name
 
                 # Cache
                 for idx_in_missing, h in enumerate([text_hashes[i] for i in missing_indices]):
@@ -227,12 +239,12 @@ class EmbeddingManager:
                         (h, blob, provider.name, len(emb), self._now_ts())
                     )
                 self.conn.commit()
-                return [e for e in embeddings if e is not None], provider.name
+                return [e for e in embeddings if e is not None], [p or provider.name for p in providers]
             except Exception as e:
                 print(f"[EmbeddingManager] Provider {provider.name} failed: {e}")
                 continue
 
-        return [e for e in embeddings if e is not None], "failed"
+        return [e for e in embeddings if e is not None], [p or "failed" for p in providers]
 
 
 @dataclass
@@ -295,8 +307,27 @@ class MemoryEngine:
                 "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
                 (1, self._now_ts()),
             )
+            current_version = 1
+
+        if current_version < 2:
+            self._migrate_v2()
+            self.conn.execute(
+                "INSERT INTO schema_version(version, applied_at) VALUES (?, ?)",
+                (2, self._now_ts()),
+            )
 
         self.conn.commit()
+
+    def _column_exists(self, table: str, column: str) -> bool:
+        if table != "chunks":
+            raise ValueError(f"Unsupported table for migration inspection: {table}")
+        rows = self.conn.execute("PRAGMA table_info(chunks)").fetchall()
+        return any(row[1] == column for row in rows)
+
+    def _migrate_v2(self):
+        """Track which embedding provider created each chunk vector."""
+        if not self._column_exists("chunks", "embedding_provider"):
+            self.conn.execute("ALTER TABLE chunks ADD COLUMN embedding_provider TEXT DEFAULT 'unknown'")
 
     def _migrate_v1(self):
         """Initial schema."""
@@ -313,6 +344,7 @@ class MemoryEngine:
                 access_count INTEGER DEFAULT 0,
                 last_accessed INTEGER,
                 importance REAL DEFAULT 0.5,
+                embedding_provider TEXT DEFAULT 'unknown',
                 metadata TEXT DEFAULT '{}',
                 UNIQUE(id)
             )
@@ -407,11 +439,12 @@ class MemoryEngine:
         words = text.split()
         chunks = []
         start = 0
+        effective_overlap = min(overlap, max(chunk_size - 1, 0))
         while start < len(words):
             end = min(start + chunk_size, len(words))
             chunk = ' '.join(words[start:end])
             chunks.append(chunk)
-            start = end - overlap if end < len(words) else end
+            start = end - effective_overlap if end < len(words) else end
         return chunks
 
     def add_chunk(self, text: str, store: str, source: str, source_type: str,
@@ -425,8 +458,8 @@ class MemoryEngine:
         now = self._now_ts()
 
         # Batch embed all chunks
-        embeddings, provider = self.embedding_mgr.get_embeddings(chunks)
-        if provider == "failed":
+        embeddings, providers = self.embedding_mgr.get_embeddings_with_providers(chunks)
+        if any(provider == "failed" for provider in providers):
             raise RuntimeError("All embedding providers failed")
 
         for i, chunk_text in enumerate(chunks):
@@ -436,10 +469,10 @@ class MemoryEngine:
 
             self.conn.execute(
                 """INSERT INTO chunks (id, store, text, source, source_type, created_at, updated_at,
-                    access_count, importance, metadata)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                    access_count, importance, embedding_provider, metadata)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)""",
                 (chunk_id, store, chunk_text, source, source_type, now, now,
-                 importance, json.dumps(metadata))
+                 importance, providers[i], json.dumps(metadata))
             )
             self.conn.execute(
                 "INSERT INTO chunks_vec(rowid, embedding) VALUES (last_insert_rowid(), ?)",
@@ -465,24 +498,21 @@ class MemoryEngine:
         query_embedding = query_embedding[0]
         query_json = json.dumps(query_embedding)
         now = self._now_ts()
-        recency_cutoff = now - (recency_days * 86400)
 
-        # Check if DB vectors are from the same provider
-        has_chunks = self.conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        can_vector = (q_provider == "gemini") or (has_chunks == 0)
-
-        # Vector search via sqlite-vec (only if provider matches)
+        # Vector search via sqlite-vec. Only compare vectors produced by the
+        # same provider as the query embedding; mixed embedding spaces produce
+        # meaningless cosine scores.
         vec_results = {}
-        if can_vector:
+        if q_provider not in {"failed", "none", "unknown"}:
             store_where = "AND c.store = ?" if store else ""
-            params = [query_json]
+            params = [query_json, q_provider]
             if store:
                 params.append(store)
             for row in self.conn.execute(f"""
                 SELECT c.id, c.rowid, vec_distance_cosine(c_vec.embedding, ?) as dist
                 FROM chunks_vec AS c_vec
                 JOIN chunks AS c ON c.rowid = c_vec.rowid
-                WHERE 1=1 {store_where}
+                WHERE c.embedding_provider = ? {store_where}
                 ORDER BY dist
                 LIMIT {top_k * 3}
             """, params):
@@ -536,7 +566,7 @@ class MemoryEngine:
 
             importance = row['importance']
 
-            if can_vector:
+            if chunk_id in vec_results:
                 final_score = (0.4 * vec_score +
                                0.3 * bm25_score +
                                0.2 * recency_score +
@@ -588,6 +618,99 @@ class MemoryEngine:
     def recall(self, query: str, store: Optional[str] = None, top_k: int = 5) -> List[Dict]:
         """High-level: recall relevant memories."""
         return self.hybrid_search(query, store=store, top_k=top_k)
+
+    def _row_to_chunk_dict(self, row: sqlite3.Row) -> Dict:
+        return {
+            'id': row['id'],
+            'store': row['store'],
+            'text': row['text'],
+            'source': row['source'],
+            'source_type': row['source_type'],
+            'created_at': datetime.fromtimestamp(row['created_at']).isoformat(),
+            'updated_at': datetime.fromtimestamp(row['updated_at']).isoformat(),
+            'access_count': row['access_count'],
+            'last_accessed': datetime.fromtimestamp(row['last_accessed']).isoformat() if row['last_accessed'] else None,
+            'importance': row['importance'],
+            'embedding_provider': row['embedding_provider'],
+            'metadata': json.loads(row['metadata'] or '{}'),
+        }
+
+    def list_chunks(self, store: Optional[str] = None, limit: int = 20, offset: int = 0) -> List[Dict]:
+        if store is not None and store not in ('episodic', 'semantic', 'procedural', 'archive'):
+            raise ValueError(f"Invalid store: {store}")
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        where = "WHERE store = ?" if store else ""
+        params = [store] if store else []
+        params.extend([limit, offset])
+        rows = self.conn.execute(
+            f"SELECT * FROM chunks {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            params,
+        ).fetchall()
+        return [self._row_to_chunk_dict(row) for row in rows]
+
+    def get_chunk(self, chunk_id: str) -> Optional[Dict]:
+        row = self.conn.execute("SELECT * FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
+        return self._row_to_chunk_dict(row) if row else None
+
+    def delete_chunk(self, chunk_id: str) -> bool:
+        row = self.conn.execute("SELECT rowid FROM chunks WHERE id = ?", (chunk_id,)).fetchone()
+        if not row:
+            return False
+        self.conn.execute("DELETE FROM chunks WHERE id = ?", (chunk_id,))
+        self.conn.execute("DELETE FROM chunks_vec WHERE rowid = ?", (row['rowid'],))
+        self.conn.commit()
+        return True
+
+    def backup(self, out_path: Path, overwrite: bool = False) -> Path:
+        out_path = Path(out_path)
+        if out_path.exists() and not overwrite:
+            raise FileExistsError(f"Backup destination already exists: {out_path}")
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn.commit()
+        shutil.copy2(self.db_path, out_path)
+        return out_path
+
+    def doctor(self) -> Dict:
+        version = self.conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] or 0
+        report = {
+            'db_path': str(self.db_path),
+            'schema_version': version,
+            'sqlite_vec': 'ok',
+            'fts': 'unknown',
+            'stats': self.get_stats(),
+            'providers': {},
+            'embedding_providers_in_db': {
+                row[0]: row[1]
+                for row in self.conn.execute(
+                    "SELECT COALESCE(embedding_provider, 'unknown'), COUNT(*) FROM chunks GROUP BY embedding_provider"
+                ).fetchall()
+            },
+            'warnings': [],
+        }
+        try:
+            self.conn.execute("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? LIMIT 1", ('test',)).fetchall()
+            report['fts'] = 'ok'
+        except Exception as e:
+            report['fts'] = f'error: {e}'
+            report['warnings'].append('FTS check failed')
+
+        for provider in self.embedding_mgr.providers:
+            if provider.name == 'gemini':
+                report['providers'][provider.name] = 'configured' if provider.api_key else 'missing key'
+            elif provider.name == 'openrouter':
+                report['providers'][provider.name] = 'configured' if provider.api_key else 'missing key'
+            elif provider.name == 'fastembed':
+                try:
+                    import importlib.util
+                    report['providers'][provider.name] = 'available' if importlib.util.find_spec('fastembed') else 'not installed'
+                except Exception:
+                    report['providers'][provider.name] = 'unknown'
+            elif provider.name == 'hash':
+                report['providers'][provider.name] = 'available'
+        if len(report['embedding_providers_in_db']) > 1:
+            report['warnings'].append('DB contains mixed embedding providers; vector search is provider-filtered')
+        return report
 
     def get_stats(self) -> Dict:
         c = self.conn.execute
@@ -680,6 +803,7 @@ class MemoryEngine:
                         (row2['text'][:200], row2['id'], row2['id'], self._now_ts(), row1['id'])
                     )
                     self.conn.execute("DELETE FROM chunks WHERE id = ?", (row2['id'],))
+                    self.conn.execute("DELETE FROM chunks_vec WHERE rowid NOT IN (SELECT rowid FROM chunks)")
                     merged += 1
 
         self.conn.commit()

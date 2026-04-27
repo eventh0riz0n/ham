@@ -4,7 +4,6 @@ Indexer for HAM.
 Indexes memory files, sessions, and workspace files into HAM.
 """
 
-import json
 import re
 from pathlib import Path
 from datetime import datetime
@@ -14,26 +13,32 @@ MEMORY_DIR = Path.home() / ".hermes" / "memory"
 SESSION_SEARCH_DIR = Path.home() / ".hermes" / "sessions"
 WORKSPACE_DIR = Path.home() / ".hermes"
 
-# Files/patterns to skip
+# Files/patterns to skip. Defaults are conservative because HAM indexes
+# private local workspaces and should never ingest secrets by accident.
 SKIP_PATTERNS = [
     r"\.db$", r"\.sqlite$", r"\.log$", r"\.jsonl$",
     r"brief_candidates\.json", r"feedback_log\.jsonl",
-    r"ham\.db$", r"\.tmp$", r"\.bak$"
+    r"ham\.db$", r"\.tmp$", r"\.bak$", r"\.pyc$",
+    r"(^|/)\.git(/|$)", r"(^|/)__pycache__(/|$)", r"(^|/)\.pytest_cache(/|$)",
+    r"(^|/)\.env$", r"(^|/)\.env\.", r"(^|/)id_rsa$", r"(^|/)id_ed25519$",
+    r"\.pem$", r"\.key$", r"credentials\.json$", r"token\.json$",
 ]
 
 
-def should_skip(path: Path) -> bool:
-    for pat in SKIP_PATTERNS:
+def should_skip(path: Path, excludes=None) -> bool:
+    patterns = SKIP_PATTERNS + list(excludes or [])
+    for pat in patterns:
         if re.search(pat, str(path)):
             return True
     return False
 
 
-def index_memory_files(engine: MemoryEngine, since: datetime = None):
+def index_memory_files(engine: MemoryEngine = None, since: datetime = None, dry_run: bool = False, excludes=None):
     """Index all markdown memory files."""
     indexed = 0
+    planned = []
     for file_path in MEMORY_DIR.rglob("*.md"):
-        if should_skip(file_path):
+        if should_skip(file_path, excludes=excludes):
             continue
         try:
             mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
@@ -55,6 +60,12 @@ def index_memory_files(engine: MemoryEngine, since: datetime = None):
                 store = "semantic"
                 importance = 0.5
 
+            if dry_run:
+                planned.append(str(file_path))
+                continue
+            if engine is None:
+                raise ValueError("engine is required unless dry_run=True")
+
             engine.add_chunk(
                 text=text,
                 store=store,
@@ -67,23 +78,29 @@ def index_memory_files(engine: MemoryEngine, since: datetime = None):
         except Exception as e:
             print(f"[WARN] Failed to index {file_path}: {e}")
 
-    return indexed
+    return planned if dry_run else indexed
 
 
-def index_workspace_docs(engine: MemoryEngine, since: datetime = None):
+def index_workspace_docs(engine: MemoryEngine, since: datetime = None, dry_run: bool = False, excludes=None):
     """Index AGENTS.md, USER.md, SOUL.md, etc."""
     docs = ["AGENTS.md", "USER.md", "SOUL.md", "TOOLS.md", "HEARTBEAT.md"]
     indexed = 0
+    planned = []
     for doc_name in docs:
         doc_path = WORKSPACE_DIR / doc_name
         if not doc_path.exists():
             continue
         try:
+            if should_skip(doc_path, excludes=excludes):
+                continue
             mtime = datetime.fromtimestamp(doc_path.stat().st_mtime)
             if since and mtime < since:
                 continue
 
             text = doc_path.read_text(encoding="utf-8")
+            if dry_run:
+                planned.append(str(doc_path))
+                continue
             engine.add_chunk(
                 text=text,
                 store="semantic",
@@ -95,18 +112,19 @@ def index_workspace_docs(engine: MemoryEngine, since: datetime = None):
             indexed += 1
         except Exception as e:
             print(f"[WARN] Failed to index {doc_name}: {e}")
-    return indexed
+    return planned if dry_run else indexed
 
 
-def index_skills(engine: MemoryEngine, since: datetime = None):
+def index_skills(engine: MemoryEngine, since: datetime = None, dry_run: bool = False, excludes=None):
     """Index all SKILL.md files."""
     skills_dir = WORKSPACE_DIR / "skills"
     if not skills_dir.exists():
-        return 0
+        return [] if dry_run else 0
 
     indexed = 0
+    planned = []
     for skill_file in skills_dir.rglob("SKILL.md"):
-        if should_skip(skill_file):
+        if should_skip(skill_file, excludes=excludes):
             continue
         try:
             mtime = datetime.fromtimestamp(skill_file.stat().st_mtime)
@@ -114,6 +132,9 @@ def index_skills(engine: MemoryEngine, since: datetime = None):
                 continue
 
             text = skill_file.read_text(encoding="utf-8")
+            if dry_run:
+                planned.append(str(skill_file))
+                continue
             engine.add_chunk(
                 text=text,
                 store="procedural",
@@ -125,29 +146,46 @@ def index_skills(engine: MemoryEngine, since: datetime = None):
             indexed += 1
         except Exception as e:
             print(f"[WARN] Failed to index skill {skill_file}: {e}")
-    return indexed
+    return planned if dry_run else indexed
 
 
-def run_full_index(engine: MemoryEngine = None, since: datetime = None):
+def run_full_index(engine: MemoryEngine = None, since: datetime = None, dry_run: bool = False, excludes=None):
     """Run complete indexing pass."""
     own_engine = engine is None
-    if own_engine:
+    if own_engine and not dry_run:
         engine = MemoryEngine(DB_PATH)
 
     print("[INDEX] Starting full index...")
     total = 0
+    planned = []
 
-    n = index_memory_files(engine, since)
-    print(f"[INDEX] Memory files: {n}")
-    total += n
+    n = index_memory_files(engine, since, dry_run=dry_run, excludes=excludes)
+    if dry_run:
+        planned.extend(n)
+        print(f"[INDEX] Memory files: {len(n)} planned")
+    else:
+        print(f"[INDEX] Memory files: {n}")
+        total += n
 
-    n = index_workspace_docs(engine, since)
-    print(f"[INDEX] Workspace docs: {n}")
-    total += n
+    n = index_workspace_docs(engine, since, dry_run=dry_run, excludes=excludes)
+    if dry_run:
+        planned.extend(n)
+        print(f"[INDEX] Workspace docs: {len(n)} planned")
+    else:
+        print(f"[INDEX] Workspace docs: {n}")
+        total += n
 
-    n = index_skills(engine, since)
-    print(f"[INDEX] Skills: {n}")
-    total += n
+    n = index_skills(engine, since, dry_run=dry_run, excludes=excludes)
+    if dry_run:
+        planned.extend(n)
+        print(f"[INDEX] Skills: {len(n)} planned")
+        print("[INDEX] Dry run. Planned files:")
+        for path in planned:
+            print(path)
+        return planned
+    else:
+        print(f"[INDEX] Skills: {n}")
+        total += n
 
     stats = engine.get_stats()
     print(f"[INDEX] Done. Total new: {total}. DB: {stats['total_chunks']} chunks, {stats['db_size_mb']} MB")
@@ -163,10 +201,12 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--full", action="store_true", help="Full re-index")
     parser.add_argument("--since", type=str, help="ISO datetime to index since")
+    parser.add_argument("--dry-run", action="store_true", help="Print files that would be indexed")
+    parser.add_argument("--exclude", action="append", default=[], help="Additional regex pattern to exclude")
     args = parser.parse_args()
 
     since = None
     if args.since:
         since = datetime.fromisoformat(args.since)
 
-    run_full_index(since=since)
+    run_full_index(since=since, dry_run=args.dry_run, excludes=args.exclude)

@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package with dev dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Ruff
+        run: ruff check .
+      - name: Tests
+        run: python -m pytest -q
+      - name: Build wheel and sdist
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Smoke test installed CLI
+        run: |
+          HAM_DB_PATH=/tmp/ham-ci.db ham --help
+          HAM_DB_PATH=/tmp/ham-ci.db ham remember "ci smoke memory" --store semantic
+          HAM_DB_PATH=/tmp/ham-ci.db ham recall "ci smoke"
+          HAM_DB_PATH=/tmp/ham-ci.db ham doctor

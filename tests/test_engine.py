@@ -1,7 +1,7 @@
 import os
 import sqlite3
 
-from ham.memory_engine import MemoryEngine, EmbeddingManager, HashProvider
+from ham.memory_engine import MemoryEngine, HashProvider
 
 
 
@@ -70,3 +70,16 @@ def test_embedding_manager_no_key_uses_hash_fallback(tmp_db):
     assert provider == "hash"
     assert len(vecs[0]) == 3072
     engine.close()
+
+
+def test_deduplicate_semantic_removes_orphan_vectors(engine):
+    engine.remember("duplicate semantic memory", store="semantic")
+    engine.remember("duplicate semantic memory memory", store="semantic")
+
+    result = engine.deduplicate_semantic(similarity_threshold=0.9)
+
+    orphan_count = engine.conn.execute(
+        "SELECT COUNT(*) FROM chunks_vec WHERE rowid NOT IN (SELECT rowid FROM chunks)"
+    ).fetchone()[0]
+    assert result["count"] >= 1
+    assert orphan_count == 0

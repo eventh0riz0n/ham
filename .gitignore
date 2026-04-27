@@ -6,4 +6,7 @@ __pycache__/
 venv/
 *.db
 *.db-journal
+dist/
+build/
+uv.lock
 .DS_Store
