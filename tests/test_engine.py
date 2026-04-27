@@ -1,30 +1,8 @@
-import json
 import os
 import sqlite3
-import tempfile
-from pathlib import Path
-
-import pytest
 
 from ham.memory_engine import MemoryEngine, EmbeddingManager, HashProvider
 
-
-@pytest.fixture
-def tmp_db():
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
-        path = Path(f.name)
-    yield path
-    path.unlink(missing_ok=True)
-
-
-@pytest.fixture
-def engine(tmp_db):
-    # disable live API calls
-    os.environ.pop("GEMINI_API_KEY", None)
-    os.environ.pop("OPENROUTER_API_KEY", None)
-    eng = MemoryEngine(tmp_db)
-    yield eng
-    eng.close()
 
 
 def test_init_creates_tables(engine, tmp_db):
@@ -82,6 +60,7 @@ def test_consolidate_episodic_no_crash(engine):
 
 def test_embedding_manager_no_key_uses_hash_fallback(tmp_db):
     os.environ.pop("GEMINI_API_KEY", None)
+    os.environ.pop("GOOGLE_API_KEY", None)
     os.environ.pop("OPENROUTER_API_KEY", None)
     engine = MemoryEngine(tmp_db)
     mgr = engine.embedding_mgr

@@ -30,8 +30,9 @@ dependencies = [
 
 [project.optional-dependencies]
 local = ["fastembed>=0.3"]      # local CPU fallback embeddings
+openrouter = ["openai>=1.0"]    # OpenRouter/OpenAI-compatible embedding fallback
 dev = ["pytest>=7.0", "black", "ruff"]
-all = ["fastembed>=0.3", "pytest>=7.0", "black", "ruff"]
+all = ["fastembed>=0.3", "openai>=1.0", "pytest>=7.0", "black", "ruff"]
 
 [project.scripts]
 ham = "ham.cli:main"

@@ -1,6 +1,6 @@
 # HAM 🍖 — Hermes Advanced Memory
 
-Local-first, multi-store memory system for AI agents. Hybrid retrieval (BM25 + vector + recency + importance) with automatic provider fallback. Zero external dependencies required.
+Local-first, multi-store memory system for AI agents. Hybrid retrieval (BM25 + vector + recency + importance) with automatic provider fallback. Zero external services required.
 
 > **Better than OpenClaw.** Smarter search. Multiple memory stores. Self-maintaining.
 
@@ -55,6 +55,9 @@ pip install -e .
 
 # Or with local fallback support
 pip install -e ".[local]"
+
+# Or everything (local fallback + OpenRouter + dev tools)
+pip install -e ".[all]"
 
 # 1. Index your workspace
 ham index --full

@@ -3,8 +3,7 @@
 
 import argparse
 import json
-import sys
-from pathlib import Path
+from datetime import datetime
 
 from ham.memory_engine import MemoryEngine, DB_PATH
 from ham.indexer import run_full_index
@@ -18,15 +17,16 @@ def cmd_recall(args):
         print("No memories found.")
         return
     for i, r in enumerate(results, 1):
+        importance = r.get('breakdown', {}).get('importance', 'n/a')
         print(f"\n--- Result {i} (score: {r.get('score', 0):.3f}) ---")
-        print(f"store: {r.get('store')} | source: {r.get('source')} | type: {r.get('source_type')}")
-        print(f"created: {r.get('created_at')} | accessed: {r.get('accessed_at')} | importance: {r.get('importance')}")
+        print(f"store: {r.get('store')} | source: {r.get('source')} | importance: {importance}")
+        print(f"created: {r.get('created_at')} | access_count: {r.get('access_count')}")
         print(f"text:\n{r.get('text', '')[:500]}")
 
 
 def cmd_remember(args):
     engine = MemoryEngine(DB_PATH)
-    chunk_id = engine.remember(
+    chunk_ids = engine.remember(
         text=args.text,
         store=args.store,
         source=args.source or "cli",
@@ -34,7 +34,9 @@ def cmd_remember(args):
         importance=args.importance,
     )
     engine.close()
-    print(f"Remembered as chunk {chunk_id}")
+    print(f"Remembered {len(chunk_ids)} chunk(s):")
+    for chunk_id in chunk_ids:
+        print(f"  {chunk_id}")
 
 
 def cmd_stats(args):
@@ -55,7 +57,8 @@ def cmd_consolidate(args):
 
 
 def cmd_index(args):
-    run_full_index()
+    since = datetime.fromisoformat(args.since) if args.since else None
+    run_full_index(since=since)
 
 
 def main():
@@ -90,7 +93,8 @@ def main():
 
     # index
     p_idx = sub.add_parser("index", help="Index files into memory")
-    p_idx.add_argument("--full", action="store_true", help="Full re-index")
+    p_idx.add_argument("--full", action="store_true", help="Full re-index (default behavior)")
+    p_idx.add_argument("--since", help="Only index files modified after ISO datetime")
     p_idx.set_defaults(func=cmd_index)
 
     args = parser.parse_args()

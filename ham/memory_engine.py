@@ -33,7 +33,7 @@ if _env_path.exists():
             key, val = line.split('=', 1)
             os.environ.setdefault(key.strip(), val.strip())
 
-DB_PATH = Path.home() / ".hermes" / "memory" / "ham.db"
+DB_PATH = Path(os.environ.get("HAM_DB_PATH", Path.home() / ".hermes" / "memory" / "ham.db"))
 EMBEDDING_DIMS = 3072  # gemini-embedding-001
 DEFAULT_CHUNK_SIZE = 400  # tokens approx
 DEFAULT_CHUNK_OVERLAP = 80
@@ -122,15 +122,22 @@ class OpenRouterProvider:
 
 
 class FastEmbedProvider:
-    """Local fallback: fastembed (ONNX, no torch). Projects to target_dim."""
+    """Local fallback: fastembed (ONNX, no torch). Loads lazily and projects to target_dim."""
     def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
-        from fastembed import TextEmbedding
-        self.model = TextEmbedding(model_name=model_name)
-        raw = list(self.model.embed(["test"]))[0]
-        self.dims = len(raw)
+        self.model_name = model_name
+        self.model = None
+        self.dims = 384
         self.name = "fastembed"
 
+    def _ensure_model(self):
+        if self.model is None:
+            from fastembed import TextEmbedding
+            self.model = TextEmbedding(model_name=self.model_name)
+            raw = list(self.model.embed(["test"]))[0]
+            self.dims = len(raw)
+
     def embed(self, texts: List[str]) -> List[List[float]]:
+        self._ensure_model()
         return [list(vec) for vec in self.model.embed(texts)]
 
 
@@ -450,6 +457,10 @@ class MemoryEngine:
         score = 0.4 * cosine_sim + 0.3 * BM25_norm + 0.2 * recency + 0.1 * importance
         Falls back to BM25+recency only if embedding provider mismatches DB vectors.
         """
+        if store is not None and store not in ('episodic', 'semantic', 'procedural', 'archive'):
+            raise ValueError(f"Invalid store: {store}")
+        top_k = max(1, min(int(top_k), 100))
+
         query_embedding, q_provider = self.embedding_mgr.get_embeddings([query])
         query_embedding = query_embedding[0]
         query_json = json.dumps(query_embedding)
@@ -463,7 +474,10 @@ class MemoryEngine:
         # Vector search via sqlite-vec (only if provider matches)
         vec_results = {}
         if can_vector:
-            store_where = f"AND c.store = '{store}'" if store else ""
+            store_where = "AND c.store = ?" if store else ""
+            params = [query_json]
+            if store:
+                params.append(store)
             for row in self.conn.execute(f"""
                 SELECT c.id, c.rowid, vec_distance_cosine(c_vec.embedding, ?) as dist
                 FROM chunks_vec AS c_vec
@@ -471,26 +485,36 @@ class MemoryEngine:
                 WHERE 1=1 {store_where}
                 ORDER BY dist
                 LIMIT {top_k * 3}
-            """, (query_json,)):
+            """, params):
                 vec_results[row[0]] = 1.0 - row[2]  # convert distance to similarity
 
         # BM25 search via FTS5
         bm25_results = {}
-        # Build FTS5 query: individual words with AND
-        words = [w for w in query.replace('"', '').split() if len(w) > 2]
-        safe_query = ' AND '.join(words) if words else query.replace('"', '""')
-        fts_store = f"AND fts.store = '{store}'" if store else ""
-        for row in self.conn.execute(f"""
-            SELECT c.id, rank
-            FROM chunks_fts AS fts
-            JOIN chunks AS c ON c.rowid = fts.rowid
-            WHERE chunks_fts MATCH ? {fts_store}
-            ORDER BY rank
-            LIMIT {top_k * 3}
-        """, (safe_query,)):
-            # rank is negative BM25, higher = better match
-            bm25_score = min(1.0, max(0.0, (-row[1]) / 10.0))  # normalize roughly
-            bm25_results[row[0]] = bm25_score
+        # Build FTS5 query from word tokens only; quote each term to avoid
+        # MATCH syntax errors from reserved words (AND/OR/NOT/NEAR) and punctuation.
+        words = re.findall(r"\w+", query)
+        safe_query = ' AND '.join(f'"{w}"' for w in words)
+        if safe_query:
+            fts_store = "AND fts.store = ?" if store else ""
+            params = [safe_query]
+            if store:
+                params.append(store)
+            try:
+                for row in self.conn.execute(f"""
+                    SELECT c.id, rank
+                    FROM chunks_fts AS fts
+                    JOIN chunks AS c ON c.rowid = fts.rowid
+                    WHERE chunks_fts MATCH ? {fts_store}
+                    ORDER BY rank
+                    LIMIT {top_k * 3}
+                """, params):
+                    # rank is negative BM25, higher = better match
+                    bm25_score = min(1.0, max(0.0, (-row[1]) / 10.0))  # normalize roughly
+                    bm25_results[row[0]] = bm25_score
+            except sqlite3.OperationalError:
+                # Keep recall robust: if FTS rejects a query despite tokenization,
+                # fall back to vector-only / recency results instead of crashing.
+                bm25_results = {}
 
         # Combine scores
         all_ids = set(vec_results.keys()) | set(bm25_results.keys())
