@@ -251,6 +251,10 @@ def test_turns_from_messages():
 def provider(tmp_path):
     p = ham.HamMemoryProvider(config={
         "db_path": str(tmp_path / "prov.db"),
+        # Nonexistent model name: the background warm thread fails fast
+        # instead of downloading the real model (matters in CI); every test
+        # swaps in FakeEmbedder anyway.
+        "embed_model": "test/nonexistent-model",
         "extract_enabled": True,
     })
     p.initialize("sess_A", hermes_home=str(tmp_path), platform="cli",
@@ -311,7 +315,8 @@ def test_provider_buffers_and_extracts_on_session_end(provider, monkeypatch):
 
 
 def test_provider_skips_extraction_for_cron_context(tmp_path, monkeypatch):
-    p = ham.HamMemoryProvider(config={"db_path": str(tmp_path / "cron.db")})
+    p = ham.HamMemoryProvider(config={"db_path": str(tmp_path / "cron.db"),
+                                      "embed_model": "test/nonexistent-model"})
     p.initialize("sess_C", hermes_home=str(tmp_path), agent_context="cron")
     p._store.embedder = FakeEmbedder()
     p.sync_turn("cron user msg", "cron reply", session_id="sess_C")

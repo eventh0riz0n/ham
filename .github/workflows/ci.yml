@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # No Hermes host in CI: tests stub agent.memory_provider (see
+      # tests/conftest.py) and use a fake embedder, so fastembed and the
+      # embedding model are not needed here.
+      - name: Install test dependencies
+        run: python -m pip install numpy pytest
+      - name: Tests
+        run: python -m pytest tests/ -q
