@@ -45,7 +45,12 @@ extract_mod = sys.modules["_hermes_user_memory.ham.extract"]
 
 
 class FakeEmbedder:
-    """Deterministic embedder: bag-of-words hash projection. No model download."""
+    """Deterministic embedder: bag-of-words md5-bucket projection.
+
+    md5, not the built-in hash() — string hashing is salted per process
+    (PYTHONHASHSEED), which made similarity scores flap across runs and
+    fail the prefetch threshold in CI. No model download.
+    """
 
     model_name = "fake"
 
@@ -53,12 +58,14 @@ class FakeEmbedder:
         return True
 
     def embed(self, texts):
+        import hashlib
         import numpy as np
         out = []
         for t in texts:
             vec = np.zeros(64, dtype="float32")
             for w in t.lower().split():
-                vec[hash(w) % 64] += 1.0
+                bucket = int(hashlib.md5(w.encode()).hexdigest(), 16) % 64
+                vec[bucket] += 1.0
             n = np.linalg.norm(vec)
             out.append(list((vec / n) if n else vec))
         return out
