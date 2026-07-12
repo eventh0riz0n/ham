@@ -362,10 +362,14 @@ class HamStore:
         recency_half_life_days: float = 90.0,
         touch: bool = True,
     ) -> List[Dict[str, Any]]:
-        """Hybrid recall: 0.5*cosine + 0.3*bm25 + 0.1*recency + 0.1*importance.
+        """Hybrid recall ranked by Reciprocal Rank Fusion of the two lanes.
 
-        Without embeddings (embedder down / NULL rows) weights renormalize to
-        0.6*bm25 + 0.2*recency + 0.2*importance for BM25-only hits.
+        RRF (k=60) replaced the v2.0 weighted sum after benchmarking on real
+        turns: rank positions are comparable across lanes, raw cosine and
+        normalized-BM25 magnitudes are not (recall@4 0.19 → 0.27 on the
+        labeled bench). The legacy weighted score is still computed — it
+        breaks RRF ties and stays visible in results; `match_score` is the
+        query-relatedness part only, meant for injection gating.
         """
         query = (query or "").strip()
         if not query:
@@ -375,6 +379,7 @@ class HamStore:
 
         # Vector lane
         vec_scores: Dict[int, float] = {}
+        vec_ranks: Dict[int, int] = {}
         qvecs = self.embedder.embed([query])
         if qvecs:
             import numpy as np
@@ -385,19 +390,22 @@ class HamStore:
                 if qn > 0:
                     sims = mat @ (q / qn)
                     order = np.argsort(-sims)[: top_k * 4]
-                    for i in order:
+                    for rank, i in enumerate(order):
                         vec_scores[ids[int(i)]] = float(sims[int(i)])
+                        vec_ranks[ids[int(i)]] = rank
 
         # BM25 lane
         bm25_scores: Dict[int, float] = {}
+        bm25_ranks: Dict[int, int] = {}
         fq = _fts_query(query)
         if fq:
             try:
-                for row in self.conn.execute(
+                for rank, row in enumerate(self.conn.execute(
                     "SELECT rowid, rank FROM facts_fts WHERE facts_fts MATCH ? ORDER BY rank LIMIT ?",
                     (fq, top_k * 4),
-                ):
+                )):
                     bm25_scores[row["rowid"]] = min(1.0, max(0.0, (-row["rank"]) / 12.0))
+                    bm25_ranks[row["rowid"]] = rank
             except sqlite3.OperationalError:
                 pass
 
@@ -432,10 +440,22 @@ class HamStore:
             imp = float(row["importance"])
             if vec is not None:
                 score = 0.5 * max(0.0, vec) + 0.3 * bm + 0.1 * rec + 0.1 * imp
+                match = (0.5 * max(0.0, vec) + 0.3 * bm) / 0.8
             else:
                 score = 0.6 * bm + 0.2 * rec + 0.2 * imp
+                match = bm
+            rrf = 0.0
+            if fid in vec_ranks:
+                rrf += 1.0 / (60 + vec_ranks[fid] + 1)
+            if fid in bm25_ranks:
+                rrf += 1.0 / (60 + bm25_ranks[fid] + 1)
             d = self._row_dict(row)
             d["score"] = round(score, 4)
+            # Query-relatedness alone (vec+bm25, no recency/importance). Gate on
+            # this, not on score: a fresh important fact scores ~0.2 before the
+            # text matches anything, which let junk through score thresholds.
+            d["match_score"] = round(match, 4)
+            d["rrf"] = round(rrf, 5)
             d["score_parts"] = {
                 "vector": round(vec, 3) if vec is not None else None,
                 "bm25": round(bm, 3),
@@ -444,7 +464,7 @@ class HamStore:
             }
             scored.append(d)
 
-        scored.sort(key=lambda x: x["score"], reverse=True)
+        scored.sort(key=lambda x: (x["rrf"], x["score"]), reverse=True)
         result = scored[:top_k]
 
         if touch and result:

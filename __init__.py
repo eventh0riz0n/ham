@@ -34,8 +34,9 @@ import json
 import logging
 import threading
 import time
+from collections import deque
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from agent.memory_provider import MemoryProvider
 
@@ -45,6 +46,36 @@ from . import extract as _extract
 logger = logging.getLogger(__name__)
 
 _PLUGIN_KEY = "ham"
+
+# Prefetch query construction. Real usage is chat-style: 43% of measured user
+# messages are under 60 chars and anaphoric ("kasuj", "a co z tamtym?") — the
+# message alone is a useless retrieval key, but the previous turn names the
+# topic. Long messages carry their own topic and are used as-is.
+MIN_QUERY_CHARS = 15
+SHORT_QUERY_CHARS = 80
+CONTEXT_SNIPPET_CHARS = 300
+MAX_QUERY_CHARS = 900
+
+# How many recent turns' injected facts to suppress from re-injection.
+DEDUP_TURNS = 3
+
+
+def build_prefetch_query(message: str, prev_user: str = "", prev_asst: str = "") -> str:
+    """Retrieval key for a turn: the message, topic-anchored when it's short.
+
+    Returns "" when there is nothing searchable (trivial message, no context).
+    """
+    message = (message or "").strip()
+    if len(message) >= SHORT_QUERY_CHARS:
+        return message[:MAX_QUERY_CHARS]
+    context = " ".join(
+        s.strip()[:CONTEXT_SNIPPET_CHARS]
+        for s in (prev_user, prev_asst) if s and s.strip()
+    )
+    query = (context + " " + message).strip() if context else message
+    if len(query) < MIN_QUERY_CHARS:
+        return ""
+    return query[:MAX_QUERY_CHARS]
 
 HAM_TOOL_SCHEMA = {
     "name": "ham_memory",
@@ -98,11 +129,16 @@ class HamMemoryProvider(MemoryProvider):
         self._agent_context = "primary"
         self._turn_buffer: Dict[str, List[Tuple[str, str]]] = {}
         self._buffer_lock = threading.Lock()
-        self._prefetch_cache: Dict[str, Tuple[str, str, float]] = {}  # sid -> (query, result, ts)
+        # sid -> (query, block, injected_ids, ts)
+        self._prefetch_cache: Dict[str, Tuple[str, str, List[int], float]] = {}
+        # sid -> deque of per-turn injected id sets; union is suppressed.
+        self._injected_recent: Dict[str, deque] = {}
         self._extracted_sessions: set = set()
 
         self._top_k = int(self._config.get("prefetch_top_k", 4))
-        self._min_score = float(self._config.get("prefetch_min_score", 0.35))
+        # 0.50 from the labeled bench: max-recall plateau ends at 0.45, junk
+        # on should-be-quiet turns halves between 0.45 and 0.50.
+        self._min_match = float(self._config.get("prefetch_min_match", 0.50))
         self._extract_enabled = bool(self._config.get("extract_enabled", True))
         self._extract_provider = str(self._config.get("extract_provider", "") or "")
         self._extract_model = str(self._config.get("extract_model", "") or "")
@@ -123,6 +159,7 @@ class HamMemoryProvider(MemoryProvider):
             {"key": "embed_model", "description": "fastembed model (local)",
              "default": DEFAULT_EMBED_MODEL},
             {"key": "prefetch_top_k", "description": "Facts injected per turn", "default": "4"},
+            {"key": "prefetch_min_match", "description": "Min query-relatedness (vec+bm25) to inject a fact", "default": "0.50"},
             {"key": "extract_enabled", "description": "LLM fact extraction at session end",
              "default": "true", "choices": ["true", "false"]},
             {"key": "extract_provider", "description": "Extraction LLM provider (empty = auxiliary compression model)", "default": ""},
@@ -189,26 +226,52 @@ class HamMemoryProvider(MemoryProvider):
 
     # -- read path ---------------------------------------------------------------
 
-    def _recall_block(self, query: str) -> str:
-        if not self._store or not query or len(query.strip()) < 3:
-            return ""
-        results = self._store.search(query, top_k=self._top_k)
-        results = [r for r in results if r["score"] >= self._min_score]
+    def _search_query_for(self, sid: str, message: str) -> str:
+        prev_u = prev_a = ""
+        with self._buffer_lock:
+            buf = self._turn_buffer.get(sid)
+            if buf:
+                prev_u, prev_a = buf[-1]
+        return build_prefetch_query(message, prev_u, prev_a)
+
+    def _recent_injected(self, sid: str) -> Set[int]:
+        turns = self._injected_recent.get(sid)
+        return set().union(*turns) if turns else set()
+
+    def _recall_block(self, sid: str, message: str) -> Tuple[str, List[int]]:
+        if not self._store:
+            return "", []
+        query = self._search_query_for(sid, message)
+        if not query:
+            return "", []
+        exclude = self._recent_injected(sid)
+        results = [
+            r for r in self._store.search(query, top_k=self._top_k + len(exclude))
+            if r["match_score"] >= self._min_match and r["id"] not in exclude
+        ][: self._top_k]
         if not results:
-            return ""
+            return "", []
         lines = ["## HAM recall (long-term memory)"]
         for r in results:
             age = time.strftime("%Y-%m", time.localtime(r["updated_at"]))
             lines.append(f"- (#{r['id']}, {r['kind']}, {age}) {r['text']}")
-        return "\n".join(lines)
+        return "\n".join(lines), [r["id"] for r in results]
+
+    def _record_injected(self, sid: str, ids: List[int]) -> None:
+        # Facts already in the model's context from the last few turns are
+        # not re-injected; a turn without recall still advances the window.
+        self._injected_recent.setdefault(sid, deque(maxlen=DEDUP_TURNS)).append(set(ids))
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         sid = session_id or self._session_id
         cached = self._prefetch_cache.pop(sid, None)
-        if cached and cached[0] == query and time.time() - cached[2] < 600:
+        if cached and cached[0] == query and time.time() - cached[3] < 600:
+            self._record_injected(sid, cached[2])
             return cached[1]
         try:
-            return self._recall_block(query)
+            block, ids = self._recall_block(sid, query)
+            self._record_injected(sid, ids)
+            return block
         except Exception as e:
             logger.debug("HAM prefetch failed: %s", e)
             return ""
@@ -218,7 +281,8 @@ class HamMemoryProvider(MemoryProvider):
         # the next prefetch() so the foreground path is a dict lookup.
         sid = session_id or self._session_id
         try:
-            self._prefetch_cache[sid] = (query, self._recall_block(query), time.time())
+            block, ids = self._recall_block(sid, query)
+            self._prefetch_cache[sid] = (query, block, ids, time.time())
         except Exception as e:
             logger.debug("HAM queue_prefetch failed: %s", e)
 
@@ -284,6 +348,9 @@ class HamMemoryProvider(MemoryProvider):
         if rewound:
             with self._buffer_lock:
                 self._turn_buffer.pop(new_session_id, None)
+            self._injected_recent.pop(new_session_id, None)
+        if old_sid and old_sid != new_session_id:
+            self._injected_recent.pop(old_sid, None)
         self._session_id = new_session_id
 
     def on_memory_write(self, action: str, target: str, content: str,

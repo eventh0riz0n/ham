@@ -1,5 +1,43 @@
 # Changelog
 
+## 2.1.0 - 2026-07-12
+
+Prefetch-quality release, driven by a labeled benchmark of 28 real
+conversation turns (dataset lives outside the repo — it contains private
+conversation content; see `bench.py`). Measured v2.0 prefetch on those turns:
+recall@4 0.163, precision 0.150, and 3.25 junk facts injected per turn on
+turns that needed no memory at all.
+
+### Added
+- `bench.py`: recall/precision/clean-noise benchmark harness comparing the
+  v2.0 policy against the current one across injection gates.
+- `match_score` on search results: query-relatedness only (vector+BM25).
+  The injection gate now uses it instead of the total score — recency and
+  importance no longer push unrelated facts over the threshold (a fresh,
+  important fact used to start at ~0.2 of 0.35 before matching any text).
+- Windowed prefetch queries (`build_prefetch_query`): messages under 80 chars
+  get the previous turn prepended as topic context — 43% of measured real
+  messages are short and anaphoric ("kasuj", "a co z tamtym?") and carried no
+  retrieval signal on their own. Trivial messages with no context skip
+  prefetch entirely.
+- Injection dedup: facts injected within the last 3 turns of a session are
+  not re-injected (27% of measured turns re-injected the previous turn's
+  facts verbatim).
+
+### Changed
+- Search ranking switched from the ad-hoc weighted sum to Reciprocal Rank
+  Fusion (k=60) of the vector and BM25 lanes; the legacy weighted score
+  remains as tie-break and diagnostic. On the bench this alone moved
+  recall@4 from 0.19 to 0.27.
+- Default injection gate `prefetch_min_match: 0.50` (calibrated on the
+  bench: the max-recall plateau ends at 0.45; junk on should-be-quiet turns
+  halves between 0.45 and 0.50). Net effect vs v2.0: recall@4 0.163 → 0.250,
+  precision 0.150 → 0.375, clean-turn noise 3.25 → 1.88 facts/turn.
+- Embedding model evaluated and deliberately kept: multilingual-MiniLM is the
+  weakest link (median cosine separation relevant-vs-junk is only 0.38 vs
+  0.29), but mpnet/e5-large were OOM-killed on the 8 GB host machine.
+  Revisit when Hermes moves to the server.
+
 ## 2.0.0 - 2026-07-02
 
 Ground-up rewrite as a **native Hermes MemoryProvider plugin**. v1 was a

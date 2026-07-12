@@ -252,6 +252,44 @@ def test_turns_from_messages():
     assert turns[1][0] == "drugie pytanie"
 
 
+def test_search_match_score_ignores_recency_importance(store):
+    """A fresh, max-importance fact must not pass the injection gate on
+    freshness alone — match_score reflects query-relatedness only."""
+    fid = store.add_fact("Preferencje treningowe: plan MOVE i okno jedzenia",
+                         kind="user_pref", importance=1.0)
+    results = store.search("konfiguracja portów serwera produkcyjnego", top_k=10)
+    for r in results:
+        if r["id"] == fid:
+            assert r["match_score"] < 0.5
+            assert r["score"] > r["match_score"]  # rec+imp inflate legacy score
+
+
+def test_search_results_ordered_by_rrf(store):
+    store.add_fact("Mail Triage działa pod adresem 8791", kind="infra")
+    store.add_fact("Zupełnie inny fakt o kotach domowych", kind="note")
+    results = store.search("mail triage adres", top_k=5)
+    rrfs = [r["rrf"] for r in results]
+    assert rrfs == sorted(rrfs, reverse=True)
+    assert results[0]["rrf"] > 0
+
+
+# -- prefetch query construction ---------------------------------------------------
+
+def test_build_query_long_message_passes_through():
+    msg = "x" * 120
+    assert ham.build_prefetch_query(msg, "poprzednia", "odpowiedź") == msg
+
+
+def test_build_query_short_message_gets_context():
+    q = ham.build_prefetch_query("popraw to", "konfiguracja watchera IMAP", "Watcher IMAP ma timeout")
+    assert "popraw to" in q and "IMAP" in q
+
+
+def test_build_query_trivial_without_context_is_empty():
+    assert ham.build_prefetch_query("ok", "", "") == ""
+    assert ham.build_prefetch_query("", "", "") == ""
+
+
 # -- provider lifecycle ------------------------------------------------------------
 
 @pytest.fixture
@@ -263,6 +301,10 @@ def provider(tmp_path):
         # swaps in FakeEmbedder anyway.
         "embed_model": "test/nonexistent-model",
         "extract_enabled": True,
+        # The 0.50 default is calibrated to the real ~150-fact store; tiny
+        # test corpora produce near-zero BM25 magnitudes (idf ~ 0), so pin a
+        # mechanics-level gate — these tests exercise behavior, not calibration.
+        "prefetch_min_match": 0.25,
     })
     p.initialize("sess_A", hermes_home=str(tmp_path), platform="cli",
                  agent_context="primary")
@@ -279,6 +321,30 @@ def test_provider_prefetch_roundtrip(provider):
 
 def test_provider_prefetch_empty_on_no_match(provider):
     assert provider.prefetch("zupełnie niezwiązane zapytanie o kosmitach xyzzy") == ""
+
+
+def test_provider_prefetch_dedups_recent_injections(provider):
+    provider._store.add_fact("Mail Triage działa pod 100.109.206.101:8791", kind="infra")
+    first = provider.prefetch("gdzie jest mail triage")
+    assert "8791" in first
+    second = provider.prefetch("gdzie jest mail triage")
+    assert "8791" not in second  # already in context from previous turn
+
+
+def test_provider_short_message_enriched_from_previous_turn(provider):
+    provider._store.add_fact(
+        "Watcher IMAP przetargów ma timeout na socket", kind="infra")
+    # Filler corpus: single-document FTS5 has idf=0 (BM25 lane scores 0);
+    # a few unrelated rows restore realistic term weighting.
+    provider._store.add_fact("Dentysta wizyta w październiku", kind="note")
+    provider._store.add_fact("Raporty tygodniowe idą na Telegram", kind="decision")
+    provider._store.add_fact("Backup rclone iCloud działa poprawnie", kind="infra")
+    provider.sync_turn(
+        "co się dzieje z watcherem IMAP od przetargów?",
+        "Watcher IMAP działa, sprawdzam szczegóły timeoutów na sockecie.",
+        session_id="sess_A")
+    block = provider.prefetch("a napraw to")
+    assert "Watcher IMAP" in block
 
 
 def test_provider_tool_recall_and_remember(provider):
