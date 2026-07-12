@@ -27,6 +27,14 @@ injected within the last 3 turns are not re-injected. Recency and importance
 still break ties and remain visible in results, but cannot push an unrelated
 fact into the context.
 
+Facts can additionally carry LLM-generated **search aliases** (v2.2):
+synonyms, cross-language terms, and entity variants indexed as a second FTS
+column (half the text's BM25 weight) and folded into the embedding.
+Generation is **opt-in** (`plugins.ham.alias_expansion: true`, or backfill
+via `hermes ham expand`) — benchmarked neutral at the current store size,
+because windowed queries already supply the topic vocabulary; see
+CHANGELOG 2.2.0. With empty aliases behavior is identical to v2.1.
+
 `bench.py` measures recall/precision/noise of the whole prefetch path
 against a labeled dataset of real turns. The dataset is **not** in the repo
 (it contains private conversation content); it lives at
@@ -61,8 +69,8 @@ First use downloads the fastembed model
 | `__init__.py` | `HamMemoryProvider` — MemoryProvider lifecycle: prefetch per turn, turn buffering, extraction triggers, `ham_memory` tool |
 | `store.py` | SQLite fact store: FTS5 (unicode61, diacritics-insensitive) + embedding BLOBs with brute-force numpy cosine; RRF hybrid ranking; consolidate/reembed maintenance |
 | `bench.py` | Prefetch benchmark harness (recall@K / precision / clean-turn noise); dataset stays outside the repo |
-| `extract.py` | Write path: one LLM call per session end — extract facts, reconcile against existing ones (add / update / supersede / noop), episode summary |
-| `cli.py` | `hermes ham status\|recall\|remember\|forget\|list\|consolidate\|reembed` |
+| `extract.py` | Write path: one LLM call per session end — extract facts, reconcile against existing ones (add / update / supersede / noop), episode summary; opt-in alias expansion |
+| `cli.py` | `hermes ham status\|recall\|remember\|forget\|list\|consolidate\|reembed\|expand` |
 | `tests/` | pytest suite (fake embedder + fake LLM; no network) |
 
 Design rationale (why no sqlite-vec, why one local embedding space, why
