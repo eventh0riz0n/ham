@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.2.0 - 2026-07-12
+
+Doc2query-style search-alias expansion — built, benchmarked, and shipped
+**disabled by default** because the measurements did not justify enabling it.
+
+### Added
+- Schema v2: `aliases` column on facts, indexed as a second FTS5 column
+  (BM25 column weights 2.0 text / 1.0 aliases); automatic, non-destructive
+  migration of v1 databases (FTS rebuild, aliases empty).
+- `store.set_aliases()` / `facts_missing_aliases()`; embeddings include
+  alias text when present; `stats()` reports `aliased`.
+- `extract.expand_aliases()`: batched LLM generation of 3-6 search aliases
+  per fact (synonyms, cross-language terms, entity variants).
+- `hermes ham expand` CLI for backfilling aliases.
+- `plugins.ham.alias_expansion` config flag (default `false`) wiring alias
+  generation for new facts into the session-end extraction flow.
+
+### Why disabled by default
+Measured on the labeled bench across gates and candidate-scan policies:
+alias expansion buys at most +0.017-0.029 recall@4 (one extra fact on the
+28-case set) and pays for it with precision (0.375 → 0.242-0.300 at
+comparable recall) or quiet-turn noise (1.88 → 2.12-2.62 facts/turn).
+The v2.1 windowed prefetch query already injects the previous turn's topic
+vocabulary — exactly what aliases were meant to supply — making expansion
+largely redundant at the current store size (~150 facts) with the current
+embedder. Worth re-testing after the embedder upgrade (server move): a
+stronger dense lane plus alias-enriched sparse lane may compound where
+MiniLM cannot.
+
 ## 2.1.0 - 2026-07-12
 
 Prefetch-quality release, driven by a labeled benchmark of 28 real

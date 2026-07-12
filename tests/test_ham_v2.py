@@ -273,6 +273,125 @@ def test_search_results_ordered_by_rrf(store):
     assert results[0]["rrf"] > 0
 
 
+# -- aliases (v2.2) -----------------------------------------------------------------
+
+def test_set_aliases_makes_fact_findable_by_alias_vocabulary(store):
+    fid = store.add_fact("Metaobserver v2 zaimplementowany: anty-rutyna, digest co 4 tiki",
+                         kind="project")
+    store.add_fact("Dentysta wizyta w październiku", kind="note")
+    store.add_fact("Backup rclone iCloud działa poprawnie", kind="infra")
+    # Alias vocabulary absent from the fact text itself:
+    assert store.set_aliases(fid, ["meta observer", "obserwator", "watchdog procesów"])
+    results = store.search("zabij meta observera", top_k=3)
+    assert results and results[0]["id"] == fid
+    assert store.stats()["aliased"] == 1
+
+
+def test_bm25_weights_text_hit_above_alias_hit(store):
+    a = store.add_fact("Watcher IMAP przetargów ma timeout", kind="infra")
+    b = store.add_fact("Zupełnie inny fakt o kotach", kind="note")
+    store.set_aliases(b, ["watcher IMAP"])
+    results = store.search("watcher IMAP", top_k=2)
+    assert results[0]["id"] == a  # text match outranks alias-only match
+
+
+def test_migration_v1_to_v2(tmp_path):
+    """A v2.0/2.1 database opens cleanly: aliases column added, FTS rebuilt."""
+    import sqlite3 as sq
+    db = tmp_path / "old.db"
+    conn = sq.connect(db)
+    conn.executescript("""
+        CREATE TABLE facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'note', importance REAL NOT NULL DEFAULT 0.5,
+            status TEXT NOT NULL DEFAULT 'active', superseded_by INTEGER,
+            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+            invalidated_at INTEGER, last_accessed INTEGER,
+            access_count INTEGER NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'manual', session_id TEXT,
+            embedding BLOB, emb_model TEXT, meta TEXT NOT NULL DEFAULT '{}');
+        CREATE VIRTUAL TABLE facts_fts USING fts5(
+            text, content='facts', content_rowid='id',
+            tokenize="unicode61 remove_diacritics 2");
+        CREATE TABLE maintenance_log (id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL, details TEXT, created_at INTEGER NOT NULL);
+        CREATE TABLE schema_version (version INTEGER PRIMARY KEY,
+            applied_at INTEGER NOT NULL);
+        INSERT INTO schema_version VALUES (1, 0);
+        INSERT INTO facts (text, kind, created_at, updated_at)
+            VALUES ('Stary fakt o konfiguracji portu 9100', 'infra', 1, 1);
+        INSERT INTO facts_fts(rowid, text)
+            VALUES (1, 'Stary fakt o konfiguracji portu 9100');
+    """)
+    conn.commit(); conn.close()
+
+    s = store_mod.HamStore(db, embed_model="fake")
+    s.embedder = FakeEmbedder()
+    assert s.conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 2
+    hits = s.search("konfiguracja portu", top_k=3)
+    assert hits and hits[0]["id"] == 1 and hits[0]["aliases"] == ""
+    assert s.set_aliases(1, ["port config"])
+    assert s.search("port config", top_k=3)
+    s.close()
+
+
+def test_expand_aliases_with_fake_llm(store):
+    f1 = store.add_fact("Metaobserver v2 zaimplementowany", kind="project")
+    f2 = store.add_fact("Backup rclone iCloud działa", kind="infra")
+    def fake_caller(instructions, payload):
+        assert "SEARCH ALIASES" in instructions
+        assert f"[{f1}]" in payload and f"[{f2}]" in payload
+        return json.dumps({"aliases": {
+            str(f1): ["meta observer", "obserwator"],
+            str(f2): ["kopia zapasowa", "chmura"],
+            "9999": ["bogus id ignored"],
+        }})
+    report = extract_mod.expand_aliases(store, llm_caller=fake_caller)
+    assert report["expanded"] == 2
+    assert store.get(f1)["aliases"] == "meta observer; obserwator"
+    assert not store.facts_missing_aliases()
+
+
+def test_extraction_expands_new_facts(store):
+    """The session-end flow gives newly added facts aliases in a follow-up call."""
+    def fake_caller(instructions, payload):
+        if "SEARCH ALIASES" in instructions:
+            fid = store.facts_missing_aliases()[0]["id"]
+            return json.dumps({"aliases": {str(fid): ["alias testowy"]}})
+        return json.dumps({"operations": [
+            {"op": "add", "text": "Nowy projekt używa portu 9100", "kind": "infra"}],
+            "session_summary": None})
+    turns = [("ustalmy port dla nowego projektu — niech będzie 9100, "
+              "bo pozostałe porty w tym zakresie są już pozajmowane przez inne usługi",
+              "Przyjąłem, port 9100 dla nowego projektu, zapisuję w konfiguracji "
+              "systemd i aktualizuję dokumentację zgodnie z konwencjami projektu."),
+             ("dzięki, zapamiętaj to na przyszłość jako obowiązującą decyzję",
+              "Zapamiętane — port 9100 zapisany jako trwała decyzja projektowa.")]
+    report = extract_mod.extract_and_reconcile(store, turns, session_id="s1",
+                                               llm_caller=fake_caller,
+                                               expand_new=True)
+    assert report["added"]
+    assert store.get(report["added"][0])["aliases"] == "alias testowy"
+
+
+def test_extraction_does_not_expand_by_default(store):
+    def fake_caller(instructions, payload):
+        assert "SEARCH ALIASES" not in instructions  # no alias follow-up call
+        return json.dumps({"operations": [
+            {"op": "add", "text": "Nowy projekt używa portu 9100", "kind": "infra"}],
+            "session_summary": None})
+    turns = [("ustalmy port dla nowego projektu — niech będzie 9100, "
+              "bo pozostałe porty w tym zakresie są już pozajmowane",
+              "Przyjąłem, port 9100 dla nowego projektu, zapisuję w konfiguracji "
+              "systemd i aktualizuję dokumentację zgodnie z konwencjami."),
+             ("dzięki, zapamiętaj to na przyszłość jako obowiązującą decyzję",
+              "Zapamiętane — port 9100 zapisany jako trwała decyzja.")]
+    report = extract_mod.extract_and_reconcile(store, turns, session_id="s2",
+                                               llm_caller=fake_caller)
+    assert report["added"]
+    assert store.get(report["added"][0])["aliases"] == ""
+
+
 # -- prefetch query construction ---------------------------------------------------
 
 def test_build_query_long_message_passes_through():
@@ -364,6 +483,8 @@ def test_provider_buffers_and_extracts_on_session_end(provider, monkeypatch):
 
     def fake_caller(prov, model):
         def _c(instructions, payload):
+            if "SEARCH ALIASES" in instructions:  # follow-up alias call
+                return json.dumps({"aliases": {}})
             calls["payload"] = payload
             return json.dumps({"operations": [
                 {"op": "add", "text": "Nowy fakt z sesji", "kind": "note"}],

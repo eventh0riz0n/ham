@@ -75,6 +75,9 @@ def ham_command(args) -> None:
             _print(store.consolidate())
         elif sub == "reembed":
             print(f"re-embedded {store.reembed_missing()} facts")
+        elif sub == "expand":
+            from .extract import expand_aliases, default_llm_caller
+            _print(expand_aliases(store, llm_caller=default_llm_caller()))
         else:
             print(f"Unknown ham command: {sub}")
     finally:
@@ -108,3 +111,4 @@ def register_cli(subparser) -> None:
 
     subs.add_parser("consolidate", help="Weekly hygiene: dedup, decay, prune (no LLM)")
     subs.add_parser("reembed", help="Embed facts missing current-model vectors")
+    subs.add_parser("expand", help="LLM-generate search aliases for facts lacking them")

@@ -42,6 +42,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     text TEXT NOT NULL,
+    aliases TEXT NOT NULL DEFAULT '',
     kind TEXT NOT NULL DEFAULT 'note',
     importance REAL NOT NULL DEFAULT 0.5,
     status TEXT NOT NULL DEFAULT 'active',
@@ -64,20 +65,21 @@ CREATE INDEX IF NOT EXISTS idx_facts_session ON facts(session_id);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
     text,
+    aliases,
     content='facts',
     content_rowid='id',
     tokenize="unicode61 remove_diacritics 2"
 );
 
 CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
-    INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+    INSERT INTO facts_fts(rowid, text, aliases) VALUES (new.id, new.text, new.aliases);
 END;
 CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
-    INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
+    INSERT INTO facts_fts(facts_fts, rowid, text, aliases) VALUES ('delete', old.id, old.text, old.aliases);
 END;
-CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE OF text ON facts BEGIN
-    INSERT INTO facts_fts(facts_fts, rowid, text) VALUES ('delete', old.id, old.text);
-    INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
+CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE OF text, aliases ON facts BEGIN
+    INSERT INTO facts_fts(facts_fts, rowid, text, aliases) VALUES ('delete', old.id, old.text, old.aliases);
+    INSERT INTO facts_fts(rowid, text, aliases) VALUES (new.id, new.text, new.aliases);
 END;
 
 CREATE TABLE IF NOT EXISTS maintenance_log (
@@ -181,18 +183,52 @@ class HamStore:
         # In-memory vector matrix cache: (ids, numpy matrix). Invalidated on writes.
         self._vec_cache = None
 
+    SCHEMA_VERSION = 2
+
     def _init_schema(self):
         with self._write_lock:
             self.conn.executescript(_SCHEMA)
             cur = self.conn.execute(
                 "SELECT MAX(version) FROM schema_version"
             ).fetchone()[0]
-            if not cur:
+            if cur == 1:
+                self._migrate_v1_to_v2()
+                cur = self.SCHEMA_VERSION
+            if not cur or cur < self.SCHEMA_VERSION:
                 self.conn.execute(
-                    "INSERT INTO schema_version(version, applied_at) VALUES (1, ?)",
-                    (int(time.time()),),
+                    "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, ?)",
+                    (self.SCHEMA_VERSION, int(time.time())),
                 )
             self.conn.commit()
+
+    def _migrate_v1_to_v2(self):
+        """v2.2: add `aliases` (search-expansion terms) and index it in FTS.
+
+        The v1 facts_fts and its triggers were created before this run's
+        executescript (IF NOT EXISTS skipped them), so drop and recreate.
+        Caller holds the write lock and commits.
+        """
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(facts)")}
+        if "aliases" not in cols:
+            self.conn.execute(
+                "ALTER TABLE facts ADD COLUMN aliases TEXT NOT NULL DEFAULT ''")
+        self.conn.executescript("""
+            DROP TRIGGER IF EXISTS facts_ai;
+            DROP TRIGGER IF EXISTS facts_ad;
+            DROP TRIGGER IF EXISTS facts_au;
+            DROP TABLE IF EXISTS facts_fts;
+        """)
+        self.conn.executescript(_SCHEMA)
+        self.conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+        self.conn.execute(
+            "INSERT OR REPLACE INTO schema_version(version, applied_at) VALUES (?, ?)",
+            (self.SCHEMA_VERSION, int(time.time())),
+        )
+        self.conn.execute(
+            "INSERT INTO maintenance_log(action, details, created_at) VALUES (?,?,?)",
+            ("migrate_v1_to_v2", '{"added": "aliases column + FTS rebuild"}',
+             int(time.time())),
+        )
 
     def close(self):
         try:
@@ -236,9 +272,7 @@ class HamStore:
 
         blob, model = None, None
         if embed:
-            vecs = self.embedder.embed([text])
-            if vecs:
-                blob, model = _pack(vecs[0]), self.embed_model
+            blob, model = self._embed_fact(text)
 
         with self._write_lock:
             cur = self.conn.execute(
@@ -252,16 +286,50 @@ class HamStore:
             self._vec_cache = None
             return int(cur.lastrowid)
 
+    def _embed_fact(self, text: str, aliases: str = ""):
+        """Embed a fact; aliases enrich the vector with the vocabulary users
+        actually search with (the fact's own wording often differs)."""
+        payload = f"{text}\n{aliases}" if aliases else text
+        vecs = self.embedder.embed([payload])
+        if vecs:
+            return _pack(vecs[0]), self.embed_model
+        return None, None
+
+    def set_aliases(self, fact_id: int, aliases: List[str]) -> bool:
+        """Attach search-expansion terms; re-embeds, keeps updated_at (aliases
+        change findability, not the fact's truth or its recency)."""
+        row = self.conn.execute(
+            "SELECT text FROM facts WHERE id = ?", (fact_id,)).fetchone()
+        if not row:
+            return False
+        seen = dict.fromkeys(a.strip() for a in aliases if a and a.strip())
+        alias_text = "; ".join(seen)[:500]
+        blob, model = self._embed_fact(row["text"], alias_text)
+        with self._write_lock:
+            self.conn.execute(
+                "UPDATE facts SET aliases=?, embedding=?, emb_model=? WHERE id=?",
+                (alias_text, blob, model, fact_id),
+            )
+            self.conn.commit()
+            self._vec_cache = None
+        return True
+
+    def facts_missing_aliases(self, limit: int = 200) -> List[Dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT id, text FROM facts
+               WHERE status='active' AND aliases='' AND kind != 'episode'
+               ORDER BY id LIMIT ?""", (max(1, int(limit)),),
+        ).fetchall()
+        return [{"id": r["id"], "text": r["text"]} for r in rows]
+
     def update_fact(self, fact_id: int, new_text: str, *, importance: Optional[float] = None) -> bool:
         """Rewrite a fact in place (same identity, refined wording)."""
         new_text = (new_text or "").strip()
-        row = self.conn.execute("SELECT id FROM facts WHERE id = ?", (fact_id,)).fetchone()
+        row = self.conn.execute(
+            "SELECT id, aliases FROM facts WHERE id = ?", (fact_id,)).fetchone()
         if not row or not new_text:
             return False
-        blob, model = None, None
-        vecs = self.embedder.embed([new_text])
-        if vecs:
-            blob, model = _pack(vecs[0]), self.embed_model
+        blob, model = self._embed_fact(new_text, row["aliases"])
         now = int(time.time())
         with self._write_lock:
             if importance is not None:
@@ -400,11 +468,15 @@ class HamStore:
         fq = _fts_query(query)
         if fq:
             try:
+                # Column weights: a text hit counts double an alias hit, with
+                # text weight 1.0 so score magnitudes (and the calibrated
+                # match gate) stay comparable to the pre-alias index.
                 for rank, row in enumerate(self.conn.execute(
-                    "SELECT rowid, rank FROM facts_fts WHERE facts_fts MATCH ? ORDER BY rank LIMIT ?",
+                    "SELECT rowid, bm25(facts_fts, 1.0, 0.5) AS r FROM facts_fts "
+                    "WHERE facts_fts MATCH ? ORDER BY r LIMIT ?",
                     (fq, top_k * 4),
                 )):
-                    bm25_scores[row["rowid"]] = min(1.0, max(0.0, (-row["rank"]) / 12.0))
+                    bm25_scores[row["rowid"]] = min(1.0, max(0.0, (-row["r"]) / 12.0))
                     bm25_ranks[row["rowid"]] = rank
             except sqlite3.OperationalError:
                 pass
@@ -505,6 +577,9 @@ class HamStore:
                 "SELECT COUNT(*) FROM facts WHERE embedding IS NOT NULL AND emb_model = ?",
                 (self.embed_model,),
             ).fetchone()[0],
+            "aliased": c(
+                "SELECT COUNT(*) FROM facts WHERE status='active' AND aliases != ''"
+            ).fetchone()[0],
             "embed_model": self.embed_model,
             "db_size_mb": round(self.db_path.stat().st_size / 1048576, 2) if self.db_path.exists() else 0,
         }
@@ -583,13 +658,16 @@ class HamStore:
     def reembed_missing(self, batch: int = 64) -> int:
         """Embed rows with NULL/foreign-model embeddings. Returns count."""
         rows = self.conn.execute(
-            "SELECT id, text FROM facts WHERE embedding IS NULL OR emb_model != ?",
+            "SELECT id, text, aliases FROM facts WHERE embedding IS NULL OR emb_model != ?",
             (self.embed_model,),
         ).fetchall()
         done = 0
         for i in range(0, len(rows), batch):
             chunk = rows[i:i + batch]
-            vecs = self.embedder.embed([r["text"] for r in chunk])
+            vecs = self.embedder.embed([
+                f"{r['text']}\n{r['aliases']}" if r["aliases"] else r["text"]
+                for r in chunk
+            ])
             if not vecs:
                 break
             with self._write_lock:

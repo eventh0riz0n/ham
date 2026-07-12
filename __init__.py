@@ -26,6 +26,7 @@ Config (all optional), in config.yaml:
       extract_enabled: true
       extract_provider: ""      # empty = auxiliary 'compression' task model
       extract_model: ""
+      alias_expansion: false    # LLM search-aliases for new facts (see CHANGELOG 2.2.0)
 """
 
 from __future__ import annotations
@@ -140,6 +141,7 @@ class HamMemoryProvider(MemoryProvider):
         # on should-be-quiet turns halves between 0.45 and 0.50.
         self._min_match = float(self._config.get("prefetch_min_match", 0.50))
         self._extract_enabled = bool(self._config.get("extract_enabled", True))
+        self._alias_expansion = bool(self._config.get("alias_expansion", False))
         self._extract_provider = str(self._config.get("extract_provider", "") or "")
         self._extract_model = str(self._config.get("extract_model", "") or "")
 
@@ -162,6 +164,8 @@ class HamMemoryProvider(MemoryProvider):
             {"key": "prefetch_min_match", "description": "Min query-relatedness (vec+bm25) to inject a fact", "default": "0.50"},
             {"key": "extract_enabled", "description": "LLM fact extraction at session end",
              "default": "true", "choices": ["true", "false"]},
+            {"key": "alias_expansion", "description": "LLM search-alias expansion for new facts (opt-in; neutral on the bench at current store size)",
+             "default": "false", "choices": ["true", "false"]},
             {"key": "extract_provider", "description": "Extraction LLM provider (empty = auxiliary compression model)", "default": ""},
             {"key": "extract_model", "description": "Extraction LLM model", "default": ""},
         ]
@@ -319,6 +323,7 @@ class HamMemoryProvider(MemoryProvider):
         caller = _extract.default_llm_caller(self._extract_provider, self._extract_model)
         return _extract.extract_and_reconcile(
             self._store, turns, session_id=sid, llm_caller=caller,
+            expand_new=self._alias_expansion,
         )
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:

@@ -180,6 +180,72 @@ def default_llm_caller(provider: str = "", model: str = "") -> Callable[[str, st
     return _call
 
 
+_ALIAS_INSTRUCTIONS = """You generate SEARCH ALIASES for facts stored in a personal AI agent's long-term memory (user: Beniamin, Polish/English mixed).
+
+The problem you solve: conversations refer to these facts with different words than the fact text uses ("zabij meta observera" must find a fact written as "Metaobserver v2 zaimplementowany..."). For each fact below, output 3-6 short aliases:
+- synonyms and conversational phrasings a user would actually type
+- the other language's terms (Polish fact -> add English terms, and vice versa)
+- entity/name variants (metaobserver / meta observer / obserwator)
+- related action words ("wyłączyć", "kasuj", "disable" for facts about stopped services)
+
+Do NOT restate the fact, do NOT invent new information, no full sentences — short search terms only. Output JSON only:
+{"aliases": {"<fact_id>": ["term", "term", ...], ...}}"""
+
+MAX_ALIASES_PER_FACT = 8
+ALIAS_BATCH = 25
+
+
+def expand_aliases(
+    store: HamStore,
+    fact_ids: Optional[List[int]] = None,
+    *,
+    llm_caller: Optional[Callable[[str, str], str]] = None,
+) -> Dict[str, Any]:
+    """Doc2query-style expansion: attach LLM-generated search aliases.
+
+    With `fact_ids` expands exactly those facts; without, backfills active
+    facts that have no aliases yet. Returns a report dict (never raises).
+    """
+    report = {"expanded": 0, "failed_batches": 0}
+    try:
+        if fact_ids:
+            rows = [f for fid in fact_ids if (f := store.get(int(fid)))]
+            targets = [{"id": f["id"], "text": f["text"]} for f in rows
+                       if f["kind"] != "episode"]
+        else:
+            targets = store.facts_missing_aliases()
+        if not targets:
+            return report
+        caller = llm_caller or default_llm_caller()
+        for i in range(0, len(targets), ALIAS_BATCH):
+            chunk = targets[i:i + ALIAS_BATCH]
+            payload = "\n".join(f"[{t['id']}] {t['text']}" for t in chunk)
+            parsed = _parse_json(caller(_ALIAS_INSTRUCTIONS, payload))
+            aliases = (parsed or {}).get("aliases")
+            if not isinstance(aliases, dict):
+                report["failed_batches"] += 1
+                logger.warning("HAM alias expansion: unparseable batch output")
+                continue
+            valid_ids = {t["id"] for t in chunk}
+            for key, terms in aliases.items():
+                try:
+                    fid = int(key)
+                except (TypeError, ValueError):
+                    continue
+                if fid not in valid_ids or not isinstance(terms, list):
+                    continue
+                terms = [str(t)[:60] for t in terms[:MAX_ALIASES_PER_FACT]]
+                if store.set_aliases(fid, terms):
+                    report["expanded"] += 1
+        logger.info("HAM alias expansion: expanded=%d failed_batches=%d",
+                    report["expanded"], report["failed_batches"])
+        return report
+    except Exception as e:
+        logger.warning("HAM alias expansion failed (non-fatal): %s", e, exc_info=True)
+        report["error"] = str(e)
+        return report
+
+
 def extract_and_reconcile(
     store: HamStore,
     turns: List[Tuple[str, str]],
@@ -187,6 +253,7 @@ def extract_and_reconcile(
     session_id: str = "",
     llm_caller: Optional[Callable[[str, str], str]] = None,
     candidate_facts: int = 20,
+    expand_new: bool = False,
 ) -> Dict[str, Any]:
     """Run one extraction pass. Returns a report dict (never raises)."""
     report = {"ran": False, "ops_applied": 0, "added": [], "updated": [],
@@ -254,6 +321,15 @@ def extract_and_reconcile(
                     report["superseded"].append({"old": int(op["id"]), "new": nid})
                     report["ops_applied"] += 1
             # noop / unknown ids / empty text → ignored by design
+
+        # Opt-in (plugins.ham.alias_expansion): benchmarked neutral at current
+        # store size — windowed prefetch queries already supply the topic
+        # vocabulary aliases would add. Re-evaluate with a stronger embedder.
+        if expand_new:
+            new_ids = report["added"] + report["updated"] + \
+                [s["new"] for s in report["superseded"]]
+            if new_ids:
+                expand_aliases(store, new_ids, llm_caller=caller)
 
         summary = (parsed.get("session_summary") or "").strip()
         if summary and len(summary) > 20:
