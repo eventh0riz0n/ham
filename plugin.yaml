@@ -1,6 +1,6 @@
 name: ham
-version: 2.0.0
-description: "HAM v2 — local hybrid memory: temporal fact store (supersede, never silently delete), BM25+vector+recency recall, LLM fact extraction at session end. 100% local storage."
+version: 2.1.0
+description: "HAM v2 — local hybrid memory: temporal fact store (supersede, never silently delete), BM25+vector recall fused with RRF, LLM fact extraction at session end. 100% local storage."
 hooks:
   - on_session_end
   - on_pre_compress

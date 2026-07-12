@@ -54,7 +54,7 @@ def ham_command(args) -> None:
             )
             for r in results:
                 flag = "" if r["status"] == "active" else " [SUPERSEDED]"
-                print(f"#{r['id']} [{r['score']}] ({r['kind']}){flag} {r['text']}")
+                print(f"#{r['id']} [match {r['match_score']} | score {r['score']}] ({r['kind']}){flag} {r['text']}")
             if not results:
                 print("(no results)")
         elif sub == "remember":

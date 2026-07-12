@@ -26,11 +26,14 @@ Everything the user tells the agent may end up in
 
 - `ham_v2.db` (or any `*.db` / WAL / SHM files)
 - backups of the database
+- the benchmark dataset (`ham_bench.json` / `ham_bench.db`) — it contains
+  verbatim fragments of real conversations; `bench.py` reads it from
+  `$HERMES_HOME/memory/`, outside the repo tree
 - `.env`, API keys, tokens, private keys
 
-The repository `.gitignore` in this plugin covers Python artifacts only —
-the database lives outside the repo tree (`$HERMES_HOME/memory/`), which is
-the primary safeguard.
+The primary safeguard is that all of the above live outside the repo tree
+(`$HERMES_HOME/memory/`); the repository `.gitignore` additionally blocks
+`*.db*` and `ham_bench*` as a second layer.
 
 ## Reviewing what is stored
 

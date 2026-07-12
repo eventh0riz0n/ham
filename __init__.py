@@ -22,7 +22,7 @@ Config (all optional), in config.yaml:
       db_path: $HERMES_HOME/memory/ham_v2.db
       embed_model: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
       prefetch_top_k: 4
-      prefetch_min_score: 0.35
+      prefetch_min_match: 0.50  # injection gate on query-relatedness (vec+bm25)
       extract_enabled: true
       extract_provider: ""      # empty = auxiliary 'compression' task model
       extract_model: ""
